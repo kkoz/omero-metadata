@@ -47,6 +47,9 @@ from omero.sys import ParametersI
 from populate_metadata import (
     get_config,
     ParsingContext,
+    OmeroDataRetriever,
+    ValueResolver,
+    ParsingUtilFactory,
     BulkToMapAnnotationContext,
     DeleteMapAnnotationContext,
 )
@@ -905,6 +908,9 @@ class TestPopulateMetadataHelper(ITest):
         self.delete(child_anns)
 
         csv = fixture.get_csv()
+        data_retriever = OmeroDataRetriever(self.client)
+        value_resolver = ValueResolver(data_retriever, target)
+        parsing_util_factory = ParsingUtilFactory(target, value_resolver)
         ctx = ParsingContext(self.client,
                              target,
                              file=csv)

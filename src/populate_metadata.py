@@ -56,6 +56,7 @@ from omero import client
 
 from omero.util.populate_roi import ThreadPool
 
+from header_resolvers import *
 
 log = logging.getLogger("omero.util.populate_metadata")
 
@@ -105,14 +106,11 @@ ADDED_COLUMN_NAMES = [PLATE_NAME_COLUMN,
                       IMAGE_NAME_COLUMN,
                       'image']
 
-
 COLUMN_TYPES = {
     'plate': PlateColumn, 'well': WellColumn, 'image': ImageColumn,
     'dataset': DatasetColumn, 'roi': RoiColumn,
     'd': DoubleColumn, 'l': LongColumn, 's': StringColumn, 'b': BoolColumn
 }
-
-REGEX_HEADER_SPECIFIER = r'# header '
 
 DEFAULT_TABLE_NAME = 'bulk_annotations'
 MAX_COLUMN_COUNT = 512
@@ -131,159 +129,123 @@ class MetadataError(Exception):
     pass
 
 
-class HeaderResolver(object):
-    """
-    Header resolver for known header names which is responsible for creating
-    the column set for the OMERO.tables instance.
-    """
+class OmeroDataRetriever(object):
+    def __init__(self, client):
+        self.client = client
+        return
 
-    DEFAULT_COLUMN_SIZE = 1
-
-    dataset_keys = {
-        'image': ImageColumn,
-        'image_name': StringColumn,
-    }
-
-    project_keys = {
-        'dataset': StringColumn,  # DatasetColumn
-        'dataset_name': StringColumn,
-        'image': ImageColumn,
-        'image_name': StringColumn,
-    }
-
-    plate_keys = dict({
-        'well': WellColumn,
-        'field': ImageColumn,
-        'row': LongColumn,
-        'column': LongColumn,
-        'wellsample': ImageColumn,
-        'image': ImageColumn,
-    })
-
-    screen_keys = dict({
-        'plate': PlateColumn,
-    }, **plate_keys)
-
-    def __init__(self, target_object, headers, column_types=None):
-        self.target_object = target_object
-        self.headers = headers
-        self.headers_as_lower = [v.lower() for v in self.headers]
-        self.types = column_types
-
-    @staticmethod
-    def is_row_column_types(row):
-        if "# header" in row[0]:
-            return True
-        return False
-
-    @staticmethod
-    def get_column_types(row):
-        if "# header" not in row[0]:
-            return None
-        get_first_type = re.compile(REGEX_HEADER_SPECIFIER)
-        column_types = [get_first_type.sub('', row[0])]
-        for column in row[1:]:
-            column_types.append(column)
-        column_types = parse_column_types(column_types)
-        return column_types
-
-    def create_columns(self):
-        target_class = self.target_object.__class__
-        target_id = self.target_object.id.val
-        if ScreenI is target_class:
-            log.debug('Creating columns for Screen:%d' % target_id)
-            return self.create_columns_screen()
-        elif PlateI is target_class:
-            log.debug('Creating columns for Plate:%d' % target_id)
-            return self.create_columns_plate()
-        elif DatasetI is target_class:
-            log.debug('Creating columns for Dataset:%d' % target_id)
-            return self.create_columns_dataset()
-        elif ProjectI is target_class:
-            log.debug('Creating columns for Project:%d' % target_id)
-            return self.create_columns_project()
-        raise MetadataError(
-            'Unsupported target object class: %s' % target_class)
-
-    def columns_sanity_check(self, columns):
-        column_types = [column.__class__ for column in columns]
-        if WellColumn in column_types and ImageColumn in column_types:
-            log.debug(column_types)
+    def get_target_group(self, target_object):
+        target_type = target_object.ice_staticId().split('::')[-1]
+        target_id = target_object.id.val
+        q = "select x.details.group.id from %s x where x.id = %d " % (
+            target_type, target_id
+        )
+        rows = unwrap(
+            self.client.sf.getQueryService().projection(
+                q, None, {'omero.group': '-1'}))
+        if rows is None or len(rows) != 1:
             raise MetadataError(
-                ('Well Column and Image Column cannot be resolved at '
-                 'the same time. Pick one.'))
-        log.debug('Sanity check passed')
+                "Cannot find %s:%d" % (self.target_type, self.target_id))
+        return rows[0][0]
 
-    def create_columns_screen(self):
-        return self._create_columns("screen")
+    def get_screen_info(self, screen_id):
+        query_service = self.client.getSession().getQueryService()
+        parameters = omero.sys.ParametersI()
+        parameters.addId(screen_id)
+        log.debug('Loading Screen:%d' % screen_id)
+        target_object = query_service.findByQuery((
+            'select s from Screen as s '
+            'join fetch s.plateLinks as p_link '
+            'join fetch p_link.child as p '
+            'where s.id = :id'), parameters, {'omero.group': '-1'})
+        if target_object is None:
+            raise MetadataError('Could not find target object!')
+        return target_object
 
-    def create_columns_plate(self):
-        return self._create_columns("plate")
+    def get_plate(self, plate_id):
+        query_service = self.client.getSession().getQueryService()
+        parameters = omero.sys.ParametersI()
+        parameters.addId(plate_id)
+        plate = query_service.findByQuery((
+            'select p from Plate p '
+            'join fetch p.wells as w '
+            'join fetch w.wellSamples as ws '
+            'join fetch ws.image as i '
+            'where p.id = :id'), parameters, {'omero.group': '-1'})
+        if plate is None:
+            raise MetadataError('Could not find target object!')
+        return plate
 
-    def create_columns_dataset(self):
-        return self._create_columns("dataset")
+    def get_dataset(self, dataset_id):
+        query_service = self.client.getSession().getQueryService()
+        parameters = omero.sys.ParametersI()
+        parameters.addId(dataset_id)
+        log.debug('Loading Dataset:%d' % dataset_id)
 
-    def create_columns_project(self):
-        return self._create_columns("project")
+        parameters.page(0, 1)
+        return unwrap(query_service.findByQuery(
+            'select d from Dataset d where d.id = :id',
+            parameters, {'omero.group': '-1'}))
 
-    def _create_columns(self, klass):
-        if self.types is not None and len(self.types) != len(self.headers):
-            message = "Number of columns and column types not equal."
-            raise MetadataError(message)
-        columns = list()
-        for i, header_as_lower in enumerate(self.headers_as_lower):
-            name = self.headers[i]
-            description = ""
-            if "%%" in name:
-                name, description = name.split("%%", 1)
-                name = name.strip()
-                # description is key=value. Convert to json
-                if "=" in description:
-                    k, v = description.split("=", 1)
-                    k = k.strip()
-                    description = json.dumps({k: v.strip()})
-            # HDF5 does not allow / in column names
-            name = name.replace('/', '\\')
-            if self.types is not None and \
-                    COLUMN_TYPES[self.types[i]] is StringColumn:
-                column = COLUMN_TYPES[self.types[i]](
-                    name, description, self.DEFAULT_COLUMN_SIZE, list())
-            elif self.types is not None:
-                column = COLUMN_TYPES[self.types[i]](name, description, list())
+    def get_image_links_for_dataset(self, dataset_id):
+        query_service = self.client.getSession().getQueryService()
+        parameters = omero.sys.ParametersI()
+        parameters.addId(dataset_id)
+        data = list()
+        while True:
+            parameters.page(len(data), 1000)
+            rv = query_service.findAllByQuery((
+                'select distinct i from Dataset as d '
+                'join d.imageLinks as l '
+                'join l.child as i '
+                'where d.id = :id order by i.id desc'),
+                parameters, {'omero.group': '-1'})
+            if len(rv) == 0:
+                break
             else:
-                try:
-                    keys = getattr(self, "%s_keys" % klass)
-                    log.debug("Adding keys %r" % keys)
-                    if keys[header_as_lower] is StringColumn:
-                        column = keys[header_as_lower](
-                            name, description,
-                            self.DEFAULT_COLUMN_SIZE, list())
-                    else:
-                        column = keys[header_as_lower](
-                            name, description, list())
-                except KeyError:
-                    log.debug("Adding string column %r" % name)
-                    column = StringColumn(
-                        name, description, self.DEFAULT_COLUMN_SIZE, list())
-            log.debug("New column %r" % column)
-            columns.append(column)
-        append = []
-        for column in columns:
-            if column.__class__ is PlateColumn:
-                append.append(StringColumn(PLATE_NAME_COLUMN, '',
-                              self.DEFAULT_COLUMN_SIZE, list()))
-            if column.__class__ is WellColumn:
-                append.append(StringColumn(WELL_NAME_COLUMN, '',
-                              self.DEFAULT_COLUMN_SIZE, list()))
-            if column.__class__ is ImageColumn:
-                append.append(StringColumn(IMAGE_NAME_COLUMN, '',
-                              self.DEFAULT_COLUMN_SIZE, list()))
-            # Currently hard-coded, but "if image name, then add image id"
-            if column.name == IMAGE_NAME_COLUMN:
-                append.append(ImageColumn("image", '', list()))
-        columns.extend(append)
-        self.columns_sanity_check(columns)
-        return columns
+                data.extend(rv)
+        if not data:
+            raise MetadataError('Could not find target object!')
+        return data
+
+    def get_project(self, project_id):
+        query_service = self.client.getSession().getQueryService()
+        parameters = omero.sys.ParametersI()
+        parameters.addId(project_id)
+        log.debug('Loading Project:%d' % project_id)
+
+        parameters.page(0, 1)
+        return unwrap(query_service.findByQuery(
+            'select p from Project p where p.id = :id',
+            parameters, {'omero.group': '-1'}))
+
+    def get_datasets_and_images_for_project(self, project_id):
+        data = list()
+        query_service = self.client.getSession().getQueryService()
+        parameters = omero.sys.ParametersI()
+        parameters.addId(project_id)
+        while True:
+            parameters.page(len(data), 1000)
+            rv = unwrap(query_service.projection((
+                'select distinct d, i '
+                'from Project p '
+                'join p.datasetLinks as pdl '
+                'join pdl.child as d '
+                'join d.imageLinks as l '
+                'join l.child as i '
+                'where p.id = :id order by i.id desc'),
+                parameters, {'omero.group': '-1'}))
+            if len(rv) == 0:
+                break
+            else:
+                data.extend(rv)
+        if not data:
+            raise MetadataError('Could not find target object!')
+        return data
+
+
+
+
 
 
 class ValueResolver(object):
@@ -298,22 +260,11 @@ class ValueResolver(object):
         AS_ALPHA.append('a' + chr(v))
     WELL_REGEX = re.compile(r'^([a-zA-Z]+)(\d+)$')
 
-    def __init__(self, client, target_object):
-        self.client = client
+    def __init__(self, data_retriever, target_object):
+        self.data_retriever = data_retriever
         self.target_object = target_object
         self.target_class = self.target_object.__class__
-        self.target_type = self.target_object.ice_staticId().split('::')[-1]
-        self.target_id = self.target_object.id.val
-        q = "select x.details.group.id from %s x where x.id = %d " % (
-            self.target_type, self.target_id
-        )
-        rows = unwrap(
-            self.client.sf.getQueryService().projection(
-                q, None, {'omero.group': '-1'}))
-        if rows is None or len(rows) != 1:
-            raise MetadataError(
-                "Cannot find %s:%d" % (self.target_type, self.target_id))
-        self.target_group = rows[0][0]
+        self.target_group = self.data_retriever.get_target_group(target_object)
         # The goal is to make this the only instance of
         # a if/elif/else block on the target_class. All
         # logic should be placed in a the concrete wrapper
@@ -404,7 +355,7 @@ class ValueResolver(object):
         if WellColumn is column_class:
             return self.wrapper.resolve_well(column, row, value)
         if PlateColumn is column_class:
-            return self.wrapper.resolve_plate(column, row, value)
+            return self.wrapper.resolve_plate(value)
         # Prepared to handle DatasetColumn
         if DatasetColumn is column_class:
             return self.wrapper.resolve_dataset(column, row, value)
@@ -456,6 +407,16 @@ class WellData(object):
         for well_sample in well.copyWellSamples():
             self.well_samples.append(WellSampleData(well_sample))
 
+    def __eq__(self, other):
+        if self.id.val != other.id.val \
+            or self.row != other.row \
+            or self.column != other.column:
+            return False
+        for i in range(0, len(self.well_samples)):
+            if not(self.well_samples[i] == other.well_samples[i]):
+                return False
+        return True
+
 
 class WellSampleData(object):
     """
@@ -467,6 +428,11 @@ class WellSampleData(object):
     def __init__(self, well_sample):
         self.id = well_sample.id
         self.image = ImageData(well_sample.getImage())
+
+    def __eq__(self, other):
+        if self.id.val != other.id.val or not(self.image == other.image):
+            return False
+        return True
 
 
 class ImageData(object):
@@ -480,14 +446,18 @@ class ImageData(object):
         self.id = image.id
         self.name = image.name
 
+    def __eq__(self, other):
+        if self.id.val !=other.id.val or self.name.val != other.name.val:
+            return False
+        return True
+
 
 class ValueWrapper(object):
 
     def __init__(self, value_resolver):
         self.resolver = value_resolver
-        self.client = value_resolver.client
+        self.data_retriever = value_resolver.data_retriever
         self.target_object = value_resolver.target_object
-        self.target_class = value_resolver.target_class
 
     def subselect(self, rows, names):
         return rows
@@ -582,7 +552,7 @@ class ScreenWrapper(SPWWrapper):
         wells = self.wells_by_id[plate]
         return wells[well_id]
 
-    def resolve_plate(self, column, row, value):
+    def resolve_plate(self, value):
         try:
             return self.plates_by_name[value].id.val
         except KeyError:
@@ -590,17 +560,8 @@ class ScreenWrapper(SPWWrapper):
             return Skip()
 
     def _load(self):
-        query_service = self.client.getSession().getQueryService()
-        parameters = omero.sys.ParametersI()
-        parameters.addId(self.target_object.id.val)
-        log.debug('Loading Screen:%d' % self.target_object.id.val)
-        self.target_object = query_service.findByQuery((
-            'select s from Screen as s '
-            'join fetch s.plateLinks as p_link '
-            'join fetch p_link.child as p '
-            'where s.id = :id'), parameters, {'omero.group': '-1'})
-        if self.target_object is None:
-            raise MetadataError('Could not find target object!')
+        self.target_object = \
+            self.data_retriever.get_screen_info(self.target_object.id.val)
         self.target_name = unwrap(self.target_object.getName())
         self.images_by_id = dict()
         self.wells_by_location = dict()
@@ -610,15 +571,7 @@ class ScreenWrapper(SPWWrapper):
         images_by_id = dict()
         self.images_by_id[self.target_object.id.val] = images_by_id
         for plate in (l.child for l in self.target_object.copyPlateLinks()):
-            parameters = omero.sys.ParametersI()
-            parameters.addId(plate.id.val)
-            plate = query_service.findByQuery((
-                'select p from Plate p '
-                'join fetch p.wells as w '
-                'join fetch w.wellSamples as ws '
-                'join fetch ws.image as i '
-                'where p.id = :id'), parameters, {'omero.group': '-1'})
-            plate = PlateData(plate)
+            plate = self.data_retriever.get_plate(plate.id.val)
             self.plates_by_name[plate.name.val] = plate
             self.plates_by_id[plate.id.val] = plate
             wells_by_location = dict()
@@ -626,7 +579,7 @@ class ScreenWrapper(SPWWrapper):
             self.wells_by_location[plate.name.val] = wells_by_location
             self.wells_by_id[plate.id.val] = wells_by_id
             self.parse_plate(
-                plate, wells_by_location, wells_by_id, images_by_id
+                PlateData(plate), wells_by_location, wells_by_id, images_by_id
             )
 
 
@@ -657,18 +610,8 @@ class PlateWrapper(SPWWrapper):
         return rows
 
     def _load(self):
-        query_service = self.client.getSession().getQueryService()
-        parameters = omero.sys.ParametersI()
-        parameters.addId(self.target_object.id.val)
-        log.debug('Loading Plate:%d' % self.target_object.id.val)
-        self.target_object = query_service.findByQuery((
-            'select p from Plate as p '
-            'join fetch p.wells as w '
-            'join fetch w.wellSamples as ws '
-            'join fetch ws.image as i '
-            'where p.id = :id'), parameters, {'omero.group': '-1'})
-        if self.target_object is None:
-            raise MetadataError('Could not find target object!')
+        self.target_object = \
+            self.data_retriever.get_plate(self.target_object.id.val)
         self.target_name = unwrap(self.target_object.getName())
         self.wells_by_location = dict()
         self.wells_by_id = dict()
@@ -708,32 +651,11 @@ class DatasetWrapper(PDIWrapper):
         return self.images_by_id[did][iid].name.val
 
     def _load(self):
-        query_service = self.client.getSession().getQueryService()
-        parameters = omero.sys.ParametersI()
-        parameters.addId(self.target_object.id.val)
-        log.debug('Loading Dataset:%d' % self.target_object.id.val)
-
-        parameters.page(0, 1)
-        self.target_object = unwrap(query_service.findByQuery(
-            'select d from Dataset d where d.id = :id',
-            parameters, {'omero.group': '-1'}))
+        dataset_id = self.target_object.id.val
+        self.target_object = self.data_retriever.get_dataset(dataset_id)
         self.target_name = self.target_object.name.val
 
-        data = list()
-        while True:
-            parameters.page(len(data), 1000)
-            rv = query_service.findAllByQuery((
-                'select distinct i from Dataset as d '
-                'join d.imageLinks as l '
-                'join l.child as i '
-                'where d.id = :id order by i.id desc'),
-                parameters, {'omero.group': '-1'})
-            if len(rv) == 0:
-                break
-            else:
-                data.extend(rv)
-        if not data:
-            raise MetadataError('Could not find target object!')
+        data = self.data_retriever.get_image_links_for_dataset(dataset_id)
 
         images_by_id = dict()
         for image in data:
@@ -773,35 +695,13 @@ class ProjectWrapper(PDIWrapper):
             return Skip()
 
     def _load(self):
-        query_service = self.client.getSession().getQueryService()
-        parameters = omero.sys.ParametersI()
-        parameters.addId(self.target_object.id.val)
-        log.debug('Loading Project:%d' % self.target_object.id.val)
-
-        parameters.page(0, 1)
-        self.target_object = unwrap(query_service.findByQuery(
-            'select p from Project p where p.id = :id',
-            parameters, {'omero.group': '-1'}))
+        project_id = self.target_object.id.val
+        self.target_object = \
+            self.data_retriever.get_project(project_id)
         self.target_name = self.target_object.name.val
 
-        data = list()
-        while True:
-            parameters.page(len(data), 1000)
-            rv = unwrap(query_service.projection((
-                'select distinct d, i '
-                'from Project p '
-                'join p.datasetLinks as pdl '
-                'join pdl.child as d '
-                'join d.imageLinks as l '
-                'join l.child as i '
-                'where p.id = :id order by i.id desc'),
-                parameters, {'omero.group': '-1'}))
-            if len(rv) == 0:
-                break
-            else:
-                data.extend(rv)
-        if not data:
-            raise MetadataError('Could not find target object!')
+        data = \
+            self.data_retriever.get_datasets_and_images_for_project(project_id)
 
         seen = dict()
         for dataset, image in data:
@@ -839,14 +739,29 @@ class ParsingUtilFactory(object):
     def get_generic_filter(self):
         return lambda row: True
 
-    def __init__(self, client, target_object, value_resolver):
+    def __init__(self, target_object, value_resolver):
         self.target_object = target_object
         self.target_class = target_object.__class__
         self.value_resolver = value_resolver
+        if ScreenI is self.target_class:
+            self.header_resolver = ScreenHeaderResolver()
+        elif PlateI is self.target_class:
+            self.header_resolver = PlateHeaderResolver()
+        elif DatasetI is self.target_class:
+            self.header_resolver = DatasetHeaderResolver()
+        elif ProjectI is self.target_class:
+            self.header_resolver = ProjectHeaderResolver()
+        else:
+            raise MetadataError(
+                'Unsupported target object class: %s' % self.target_class)
 
     def get_value_resolver(self):
         return self.value_resolver
 
+    def get_header_resolver(self):
+        return self.header_resolver
+
+    #Filter Functions
     def get_filter_function(self, column_index=-1):
         if PlateI is self.target_class and column_index != -1:
             return self.get_filter_for_plate(
@@ -854,13 +769,21 @@ class ParsingUtilFactory(object):
         else:
             return self.get_generic_filter()
 
+    def get_filter_for_plate(self, column_index, target_name):
+        return lambda row : True if row[column_index] == target_name else False
+
+    def get_generic_filter(self):
+        return lambda row : True
+
+
 
 class ParsingContext(object):
     """Generic parsing context for CSV files."""
 
-    def __init__(self, client, target_object, file=None, fileid=None,
-                 cfg=None, cfgid=None, attach=False, column_types=None,
-                 options=None, batch_size=1000, loops=10, ms=500):
+    def __init__(self, client, target_object, parsing_util_factory, file=None,
+                 fileid=None, cfg=None, cfgid=None, attach=False,
+                 column_types=None, options=None, batch_size=1000,
+                 loops=10, ms=500):
         '''
         This lines should be handled outside of the constructor:
 
@@ -878,10 +801,9 @@ class ParsingContext(object):
         self.target_object = target_object
         self.file = file
         self.column_types = column_types
-        self.value_resolver = ValueResolver(client, target_object)
-        self.parsing_util_factory = ParsingUtilFactory(client,
-                                                       target_object,
-                                                       self.value_resolver)
+        self.parsing_util_factory = parsing_util_factory
+        self.value_resolver = self.parsing_util_factory.get_value_resolver()
+        self.header_resolver = self.parsing_util_factory.get_header_resolver()
 
     def create_annotation_link(self):
         self.target_class = self.target_object.__class__
@@ -922,10 +844,8 @@ class ParsingContext(object):
         if self.column_types is None and first_row_is_types:
             self.column_types = HeaderResolver.get_column_types(first_row)
         log.debug('Column types: %r' % self.column_types)
-        self.header_resolver = HeaderResolver(
-            self.target_object, header_row,
-            column_types=self.column_types)
-        self.columns = self.header_resolver.create_columns()
+        self.columns = self.header_resolver.create_columns(header_row,
+            self.column_types)
         log.debug('Columns: %r' % self.columns)
         if len(self.columns) > MAX_COLUMN_COUNT:
             log.warn("Column count exceeds max column count")
@@ -953,6 +873,7 @@ class ParsingContext(object):
         self.populate_from_reader(reader, self.filter_function, table, 1000)
         self.create_file_annotation(table)
 
+        self.post_process()
         log.debug('Column widths: %r' % self.get_column_widths())
         log.debug('Columns: %r' % [
             (o.name, len(o.values)) for o in self.columns])
@@ -985,11 +906,6 @@ class ParsingContext(object):
             data.close()
 
     def preprocess_data(self, reader):
-        # Get count of data columns - e.g. NOT Well Name
-        column_count = 0
-        for column in self.columns:
-            if column.name not in ADDED_COLUMN_NAMES:
-                column_count += 1
         for i, row in enumerate(reader):
             row = [(self.columns[i], value) for i, value in enumerate(row)]
             for column, original_value in row:
@@ -1127,6 +1043,7 @@ class ParsingContext(object):
                     resolve_image_names = True
                     log.debug("Resolving Image Ids")
 
+        log.debug("Column by name:%r" % columns_by_name)
         if well_name_column is None and plate_name_column is None \
                 and image_name_column is None:
             log.info('Nothing to do during post processing.')
@@ -1910,19 +1827,6 @@ def parse_target_object(target_object):
     raise ValueError('Unsupported target object: %s' % target_object)
 
 
-def parse_column_types(column_type_list):
-    column_types = []
-    for column_type in column_type_list:
-        if column_type.lower() in COLUMN_TYPES:
-            column_types.append(column_type.lower())
-        else:
-            column_types = []
-            message = "\nColumn type '%s' unknown.\nChoose from following: " \
-                "%s" % (column_type, ",".join(COLUMN_TYPES.keys()))
-            raise MetadataError(message)
-    return column_types
-
-
 if __name__ == "__main__":
     try:
         options, args = getopt(sys.argv[1:], "s:p:u:w:k:c:id", ["columns="])
@@ -1986,6 +1890,9 @@ if __name__ == "__main__":
 
         log.debug('Creating pool of %d threads' % thread_count)
         thread_pool = ThreadPool(thread_count)
+        data_retriever = OmeroDataRetriever(client)
+        value_resolver = ValueResolver(data_retriever, target_object)
+        parsing_util_factory = ParsingUtilFactory(target_object, value_resolver)
         ctx = context_class(
             client,
             target_object,
