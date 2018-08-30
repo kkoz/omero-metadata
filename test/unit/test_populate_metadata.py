@@ -3,7 +3,6 @@
 
 import pytest
 
-from omero import client
 import omero.model
 import omero.grid
 import omero.clients
@@ -21,6 +20,7 @@ from omero.grid import DatasetColumn
 
 
 from populate_metadata import *
+from value_resolvers import *
 
 ###Generic Mocks###
 class MockParent(object):
@@ -235,19 +235,4 @@ def test_preprocess_data():
     for width in widths:
         assert width == len(get_dummy_string_rows()[0][0])
 
-###Test Wrappers###
 
-def test_load_screen_wrapper():
-    sw = ScreenWrapper(MockValueResolver())
-    for plate in dummy_plates:
-        assert sw.get_plate_name_by_id(plate.id.val) == plate.name.val
-        assert plate.id.val == sw.resolve_plate(plate.name.val)
-        for well in plate.wells:
-            assert sw.get_well_by_id(well.id.val, plate.id.val) == well
-
-
-def test_load_plate_wrapper():
-    pw = PlateWrapper(MockValueResolver("0"))
-    for well in dummy_plates[0].wells:
-        assert WellData(well) == pw.get_well_by_id(well.id.val)
-        

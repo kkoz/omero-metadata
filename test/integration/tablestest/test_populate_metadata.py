@@ -83,10 +83,10 @@ class TestPopulateMetadata(ITest):
         col_count = 2
         plate = self.create_plate(row_count, col_count)
         data_retriever = OmeroDataRetriever(self.client)
-        value_resolver = ValueResolver(data_retriever, plate)
-        parsing_util_factory = ParsingUtilFactory(plate, value_resolver)
+        parsing_util_factory = ParsingUtilFactory(plate, data_retriever)
         ctx = ParsingContext(self.client,
                              plate,
+                             parsing_util_factory,
                              file=csv_name)
         ctx.parse()
         # Delete local temp file
