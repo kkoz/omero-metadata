@@ -128,8 +128,6 @@ class ValueResolver(object):
     def __init__(self, data_retriever, target_object):
         self.data_retriever = data_retriever
         self.target_object = target_object
-        self.target_class = self.target_object.__class__
-        self.target_group = self.data_retriever.get_target_group(target_object)
 
     def get_well_name(self, well_id, plate=None):
         well = self.get_well_by_id(well_id, plate)

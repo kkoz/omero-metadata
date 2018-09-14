@@ -21,6 +21,7 @@ from omero.grid import DatasetColumn
 
 from populate_metadata import *
 from value_resolvers import *
+from header_resolvers import *
 
 ###Generic Mocks###
 class MockParent(object):
@@ -99,7 +100,8 @@ for i in range(0, 3):
     #Create Wells
     wells = []
     for j in range(0, 4):
-        well_samples = [MockWellSample(str(k), str(k)) for k in range(j, j+3)]
+        well_samples = [MockWellSample(str(k), str(k)) for
+                        k in range(i*100 + j*10, i*100 + j*10 +3)]
         id_num = i*10 + j
         row_num = i*4 + j
         well = MockWell(str(id_num), row_num, j%2, well_samples)
@@ -123,6 +125,9 @@ class MockScreenData(object):
 class MockDataRetriever(object):
     def __init__(self):
         return
+
+    def get_target_group(self, target_object):
+        return {}
 
     def get_screen_info(self, screen_id):
         return MockScreenData()
@@ -235,4 +240,52 @@ def test_preprocess_data():
     for width in widths:
         assert width == len(get_dummy_string_rows()[0][0])
 
+###Header Resolver Tests###
+def test_header_resolvers():
+    header_resolver = HeaderResolver()
 
+def test_is_row_column_types():
+    assert HeaderResolver.is_row_column_types(["test"]) == False
+    assert HeaderResolver.is_row_column_types(["# header"]) == True
+    with pytest.raises(IndexError):
+        HeaderResolver.is_row_column_types([])
+
+###Test Value Resolvers###
+
+def test_spw_value_resovler():
+    plate_num = 0
+    spw = SPWValueResolver(MockDataRetriever(), MockIdentifiable(str(plate_num)))
+    wells_by_location = dict()
+    wells_by_id = dict()
+    images_by_id = dict()
+    spw.parse_plate(dummy_plates[plate_num], wells_by_location, wells_by_id, images_by_id)
+    for well in dummy_plates[plate_num].wells:
+        well_id = well.id.val
+        assert wells_by_id[well_id] == well
+        row = spw.AS_ALPHA[well.row.val]
+        col = str(well.column.val + 1)
+        assert wells_by_location[row][col] == well
+        for well_sample in well.well_samples:
+            assert images_by_id[well_sample.image.id.val] == well_sample.image
+
+
+def test_load_screen_value_resolver():
+    sw = ScreenValueResolver(MockDataRetriever(), MockIdentifiable("1"))
+    for plate in dummy_plates:
+        assert sw.get_plate_name_by_id(plate.id.val) == plate.name.val
+        assert plate.id.val == sw.resolve_plate(plate.name.val)
+        for well in plate.wells:
+            assert sw.get_well_by_id(well.id.val, plate.id.val) == well
+
+def test_load_plate_value_resolver():
+    test_id = "0"
+    pw = PlateValueResolver(MockDataRetriever(), MockIdentifiable(test_id))
+    for well in dummy_plates[int(test_id)].wells:
+        assert WellData(well) == pw.get_well_by_id(well.id.val)
+        
+#def test_plate_vw_get_image_name_by_id():
+#    test_id = "0"
+#    pw = PlateValueResolver(MockDataRetriever(), MockIdentifiable(test_id))
+#    for well in dummy_plates[int(test_id)].wells:
+#        for well_sample in well.well_samples:
+#            assert pw.get_image_name_by_id(well_sample.image.id.val, pid=test_id)
