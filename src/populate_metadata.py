@@ -56,7 +56,6 @@ from omero import client
 
 from omero.util.populate_roi import ThreadPool
 
-
 log = logging.getLogger("omero.util.populate_metadata")
 
 
@@ -400,7 +399,6 @@ class ValueResolver(object):
             except KeyError:
                 log.debug('Image Id: %i not found!' % (value))
                 return -1L
-            return
         if WellColumn is column_class:
             return self.wrapper.resolve_well(column, row, value)
         if PlateColumn is column_class:
@@ -917,6 +915,12 @@ class ParsingContext(object):
             header_index = 1
             header_row = reader.next()
         log.debug('Header: %r' % header_row)
+        for h in header_row:
+            try:
+                h.encode('ascii')
+            except UnicodeDecodeError as e:
+                raise Exception('Cannont have non-ASCII characters in column names. '
+                    'Please change column name %s' % h)
         for h in first_row:
             if not h:
                 raise Exception('Empty column header in CSV: %s'

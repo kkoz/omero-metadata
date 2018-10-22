@@ -33,6 +33,8 @@ from populate_metadata import ParsingContext
 from omero.constants.namespaces import NSBULKANNOTATIONS
 
 
+import pytest
+
 class TestPopulateMetadata(ITest):
 
     def create_csv(self, csv_filename):
@@ -46,6 +48,19 @@ class TestPopulateMetadata(ITest):
             csv_file.write("\n".join(row_data))
         finally:
             csv_file.close()
+
+    def create_csv_unicode_headers(self, csv_filename):
+
+        col_names = u"µm²,Well,Well Type,Concentration"
+        row_data = ["11,A1,Control,0", "22,A2,Treatment,10"]
+        csv_file = open(csv_filename, 'w')
+        try:
+            csv_file.write(col_names.encode('utf8'))
+            csv_file.write("\n")
+            csv_file.write("\n".join(row_data))
+        finally:
+            csv_file.close()
+
 
     def create_plate(self, row_count, col_count):
         uuid = self.ctx.sessionUuid
@@ -116,3 +131,22 @@ class TestPopulateMetadata(ITest):
                 assert "Treatment" in row_values
             else:
                 assert False, "Row does not contain 'a1' or 'a2'"
+
+    def test_unicode_headers(self):
+        """
+            Create a small csv file, use populate_metadata.py to parse and
+            attach to Plate. Then query to check table has expected content.
+        """
+
+        csv_name = "testCreateUnicode.csv"
+        self.create_csv_unicode_headers(csv_name)
+        row_count = 1
+        col_count = 2
+        plate = self.create_plate(row_count, col_count)
+        ctx = ParsingContext(self.client,
+                             plate,
+                             file=csv_name)
+        with pytest.raises(Exception):
+            ctx.parse()
+        os.remove(csv_name)
+
